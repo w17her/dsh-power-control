@@ -10,6 +10,14 @@ Windows-desktop only, because that is where the app process tree lives.
 > 在 DSH 界面里直接「刷新界面 / 重启应用 / 关闭应用」，不用再去任务栏关窗口。
 > 刷新在任何 DSH 环境都能用；重启与关机只支持 Windows 桌面版。
 
+## Download
+
+- **Installable bundle:** [`dsh-power-control-1.0.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.0.0/dsh-power-control-1.0.0.zip) — unzip it and install the folder (see below).
+- **Or clone this repository** — its root *is* the plugin: `package.json`, `index.js`,
+  `client.js`, `cordis.patch.yml`, `locale/`, `icon.svg`. There is no build step and no
+  compiled output to fetch.
+
+
 ---
 
 ## Features
@@ -37,24 +45,31 @@ Windows-desktop only, because that is where the app process tree lives.
 
 ## Install
 
-The plugin is a local DSH bundle, not an npm package. Clone it somewhere stable and let
-DSH's plugin manager link the folder:
+The plugin is a local DSH bundle, not an npm package. Either way works:
+
+**Option 1 — the release zip.** Download
+[`dsh-power-control-1.0.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.0.0/dsh-power-control-1.0.0.zip),
+unzip it, and install the unzipped folder (the one that contains `package.json`) with DSH's
+plugin manager:
+
+```
+plugin_manager install_bundle  target = <path to the unzipped dsh-power-control folder>
+```
+
+**Option 2 — clone.** Clone it somewhere stable and install the same folder:
 
 ```powershell
 git clone https://github.com/w17her/dsh-power-control.git "$env:USERPROFILE\dsh-power-control"
 ```
 
-Then, in DSH, either open **Settings → Plugins → Install from folder** and pick the cloned
-folder, or ask your DSH agent to install it:
+In both cases DSH links the directory into the active profile and reloads the Host, and the
+power button appears in the sidebar footer immediately. In the GUI, **Settings → Plugins**
+shows the same entry; installing from a local folder is the supported path for a bundle
+that is not published to a registry.
 
-> Install the DSH plugin bundle at `%USERPROFILE%\dsh-power-control`.
+To update a clone: `git pull`. Client changes hot-reload; Host changes need the plugin to
+be toggled off and on (or the app restarted).
 
-Under the hood that is `plugin_manager install_bundle` with the folder path as target. DSH
-links the directory into the active profile and reloads the Host; the power button appears
-in the sidebar footer immediately.
-
-To update: `git pull` in the cloned folder. Client changes hot-reload; Host changes need
-the plugin to be toggled off and on (or the app restarted).
 
 ## Uninstall
 
