@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "电源控制",
+    "description": "在 DeepSeek Harness 界面内一键刷新、重启或关闭应用，无需从任务栏或托盘操作。"
+  }
+}

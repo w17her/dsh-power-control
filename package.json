@@ -1,0 +1,45 @@
+{
+  "name": "@local/dsh-power-control",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reload, restart, or shut down the DeepSeek Harness desktop app from inside its window.",
+  "license": "MIT",
+  "author": "w17her",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "power",
+    "shutdown",
+    "restart",
+    "windows"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/w17her/dsh-power-control.git"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  }
+}

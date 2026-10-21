@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-power-control
+      name: '@local/dsh-power-control'
