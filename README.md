@@ -12,7 +12,7 @@ Windows-desktop only, because that is where the app process tree lives.
 
 ## Download
 
-- **Installable bundle:** [`dsh-power-control-1.0.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.0.0/dsh-power-control-1.0.0.zip) — unzip it and install the folder (see below).
+- **Installable bundle:** [`dsh-power-control-1.2.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.2.0/dsh-power-control-1.2.0.zip) — unzip it and install the folder (see below).
 - **Or clone this repository** — its root *is* the plugin: `package.json`, `index.js`,
   `client.js`, `cordis.patch.yml`, `locale/`, `icon.svg`. There is no build step and no
   compiled output to fetch.
@@ -48,7 +48,7 @@ Windows-desktop only, because that is where the app process tree lives.
 The plugin is a local DSH bundle, not an npm package. Either way works:
 
 **Option 1 — the release zip.** Download
-[`dsh-power-control-1.0.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.0.0/dsh-power-control-1.0.0.zip),
+[`dsh-power-control-1.2.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.2.0/dsh-power-control-1.2.0.zip),
 unzip it, and install the unzipped folder (the one that contains `package.json`) with DSH's
 plugin manager:
 
@@ -93,20 +93,44 @@ So the plugin splits the job in two:
      process image via `Get-Process -Id <ppid>`, and refuses to act unless the parent is
      the same executable (this is what keeps `dsh web` in a terminal safe),
    - flushes open sessions (`ctx.get('sessions')` → `flush`) with a 3 s budget,
-   - answers `200`, then spawns a **detached** PowerShell helper and returns. The helper
-     outlives the Host, which is the point: it is the only actor that can kill the tree.
+   - answers `200`, then hands the job to a **Windows scheduled task** and returns. The
+     task runs outside the Host, which is the point: it is the only actor that can kill
+     the process tree the Host lives in.
 2. **Client half** (`client.js`, `window.__ModuleLoader__`) renders the button and menu in
    `sidebar.footer.action`, and the menu/confirmation overlay in `shell.overlay`.
 
-The helper script lives in `%TEMP%\dsh-power-*\power.ps1`, logs to
-`%TEMP%\dsh-power-control.log`, waits 700 ms so the HTTP response lands, then
-`Stop-Process -Name <image> -Force`. For a restart it waits for the old instance to
-disappear (up to 30 s), clears the desktop-only environment variables, and
+The Host writes two small scripts into `%TEMP%\dsh-power-<id>\` and starts a **launcher**
+that stays attached to the Host, so the Host always sees its child. The launcher creates a
+one-shot scheduled task (`dsh-power-control-<id>`, `schtasks.exe /Create /SC ONCE`),
+runs it, and reports back whether the task actually executed. The task body
+(`teardown.ps1`) logs to `%TEMP%\dsh-power-control.log`, waits 900 ms so the HTTP response
+lands, then `Stop-Process -Name <image> -Force`. For a restart it waits for the old
+instance to disappear (up to 30 s), clears the desktop-only environment variables, and
 `Start-Process` the executable again — it never starts a second instance while the old
-one is still alive, so two instances can't race over the profile lock.
+one is still alive, so two instances can't race over the profile lock. The task deletes
+itself and its temp folder on the way out.
+
+Why a scheduled task instead of a detached child: in DSH 0.2.x the Host's detached
+`powershell.exe` gets a pid but is never scheduled — the script does not run a single
+line. An ordinary attached child works, so the task is created by an attached launcher,
+and the killing runs in the Task Scheduler service, outside the tree it is about to end.
 
 `taskkill` is deliberately not used: it is unreliable here (it can report
 `Access denied` even for a PID that no longer exists), while `Stop-Process` behaves.
+
+## Troubleshooting
+
+- **Nothing happens when you click restart or shut down.** Read
+  `%TEMP%\dsh-power-control.log`. A normal run starts with `launcher start`, then
+  `task create` / `task run`, then `teardown-start action=… image=…`, then either
+  `stopped` or `relaunched`. A missing log means the task never ran.
+- **`task-did-not-run` in the log.** Task Scheduler refused to start it (policy, UAC, or a
+  locked-down machine). Check `schtasks /Query /TN dsh-power-control-*`.
+- **Buttons greyed out, status line shows an error.** The Host route did not answer. Ask
+  your DSH agent to `POST /__dsh-power {"action":"probe"}` and read the JSON.
+- **Self-check without killing anything.** `{"action":"selftest"}` runs a harmless task and
+  returns its marker; `{"action":"verify"}` starts a throwaway `ping.exe`, tears it down
+  through the real path, and returns before/after counts.
 
 ## Safety and limits
 
@@ -122,7 +146,7 @@ one is still alive, so two instances can't race over the profile lock.
 ## Repository layout
 
 ```
-index.js            Host half: the /__dsh-power route and the helper launcher
+index.js            Host half: the /__dsh-power route, launcher and teardown task
 client.js           Client half: sidebar button, menu, confirmation overlay
 cordis.patch.yml    Bundle patch that inserts the plugin into the profile
 locale/en.json      Plugin display metadata (English)

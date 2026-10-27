@@ -22,6 +22,8 @@ window.__ModuleLoader__.load({
         cancel: '取消',
         confirmRestart: '确认重启',
         confirmShutdown: '确认关闭',
+        ready: '已连接桌面版',
+        retry: '重新检测',
         restarting: '正在重启，请稍候…',
         shuttingDown: '正在关闭，请稍候…',
         stalled: '进程似乎没有退出？点此重新加载界面',
@@ -43,6 +45,8 @@ window.__ModuleLoader__.load({
         cancel: 'Cancel',
         confirmRestart: 'Restart now',
         confirmShutdown: 'Shut down now',
+        ready: 'Desktop app connected',
+        retry: 'Check again',
         restarting: 'Restarting, please wait…',
         shuttingDown: 'Shutting down, please wait…',
         stalled: 'Still running? Reload this window',
@@ -69,7 +73,11 @@ window.__ModuleLoader__.load({
 .dpc-item:disabled{opacity:.4;cursor:not-allowed}
 .dpc-item svg{width:18px;height:18px;flex:none;color:var(--dsw-alias-label-secondary)}
 .dpc-item.dpc-danger:hover:not(:disabled){color:var(--dsw-alias-state-error-primary)}
-.dpc-hint{padding:7px 12px 6px;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);white-space:normal;max-width:220px}
+.dpc-state{display:flex;align-items:center;gap:7px;padding:7px 10px 7px;margin-bottom:4px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:11.5px;line-height:1.4;color:var(--dsw-alias-label-secondary);white-space:normal;max-width:232px}
+.dpc-dot{width:6px;height:6px;border-radius:50%;flex:none;background:var(--dsw-alias-state-success-primary)}
+.dpc-dot-idle{background:var(--dsw-alias-state-idle-primary)}
+.dpc-dot-error{background:var(--dsw-alias-state-error-primary)}
+.dpc-retry{color:var(--dsw-alias-brand-primary);font-size:12px;height:28px}
 .dpc-veil{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.28);z-index:40;pointer-events:auto}
 .dpc-dialog{width:min(360px,calc(100vw - 48px));box-sizing:border-box;padding:18px;border-radius:12px;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);box-shadow:0 20px 48px rgba(0,0,0,.24);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;line-height:1.6}
 .dpc-dialog h2{margin:0 0 6px;font-size:14px;font-weight:600}
@@ -100,6 +108,10 @@ window.__ModuleLoader__.load({
     let state = {
       probe: 'loading',
       desktop: false,
+      target: null,
+      reason: null,
+      fault: null,
+      lastReport: null,
       menu: false,
       anchor: null,
       pending: null,
@@ -162,13 +174,56 @@ window.__ModuleLoader__.load({
       return value;
     }
 
-    let probed = false;
-    function probeOnce() {
-      if (probed) return;
-      probed = true;
-      callPower({ action: 'probe' })
-        .then((value) => patch({ probe: 'ready', desktop: value.desktop === true }))
-        .catch(() => patch({ probe: 'error', desktop: false }));
+    let probeGeneration = 0;
+    let probing = false;
+
+    function reportFault(code, status) {
+      callPower({ action: 'report', code, status }).catch(() => undefined);
+    }
+
+    /**
+     * The page can boot before the Host half has registered its route — bundles
+     * load in profile order and this one is last — so a one-shot probe used to
+     * latch a permanent failure. Retry with backoff, and let the menu force a
+     * fresh attempt instead of staying disabled until a reload.
+     */
+    function ensureProbe(force) {
+      if (probing) return;
+      if (!force && store.get().probe === 'ready') return;
+      probing = true;
+      const generation = ++probeGeneration;
+      const delays = [0, 600, 1600, 3200];
+      const attempt = (index) => {
+        if (generation !== probeGeneration) {
+          probing = false;
+          return;
+        }
+        callPower({ action: 'probe' })
+          .then((value) => {
+            if (generation !== probeGeneration) return;
+            probing = false;
+            patch({
+              probe: 'ready',
+              desktop: value.desktop === true,
+              target: typeof value.target === 'string' ? value.target : null,
+              reason: typeof value.reason === 'string' ? value.reason : null,
+              fault: null,
+              lastReport: value.lastClientReport ?? null,
+            });
+          })
+          .catch((error) => {
+            if (generation !== probeGeneration) return;
+            if (index + 1 < delays.length) {
+              setTimeout(() => attempt(index + 1), delays[index + 1]);
+              return;
+            }
+            probing = false;
+            const fault = error.code || error.message || 'probe-failed';
+            patch({ probe: 'error', desktop: false, fault });
+            reportFault(fault, null);
+          });
+      };
+      attempt(0);
     }
 
     function run(action) {
@@ -199,7 +254,7 @@ window.__ModuleLoader__.load({
       const rootRef = React.useRef(null);
 
       React.useEffect(() => {
-        probeOnce();
+        ensureProbe(false);
         triggerNode = rootRef.current;
         return () => {
           triggerNode = null;
@@ -226,6 +281,7 @@ window.__ModuleLoader__.load({
             const node = rootRef.current;
             if (node === null) return;
             const rect = node.getBoundingClientRect();
+            if (!snapshot.menu && snapshot.probe !== 'ready') ensureProbe(true);
             patch({
               menu: !snapshot.menu,
               anchor: snapshot.menu ? null : { left: rect.left, top: rect.top },
@@ -285,13 +341,25 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('keydown', onKeyDown, true);
       }, [snapshot.pending, snapshot.busy]);
 
-      const hint = snapshot.probe === 'loading'
+      const statusText = snapshot.probe === 'loading'
         ? copy.checking
         : snapshot.probe === 'error'
-          ? copy.probeFailed
+          ? `${copy.probeFailed}${snapshot.fault ? ` (${snapshot.fault})` : ''}`
           : snapshot.desktop
-            ? null
+            ? (snapshot.target ? `${copy.ready} · ${snapshot.target}` : copy.ready)
             : copy.desktopOnly;
+
+      const dotClass = snapshot.probe === 'ready' && snapshot.desktop
+        ? 'dpc-dot'
+        : snapshot.probe === 'loading'
+          ? 'dpc-dot dpc-dot-idle'
+          : 'dpc-dot dpc-dot-error';
+
+      const retryRow = snapshot.probe !== 'error' ? null : h('button', {
+        type: 'button',
+        className: 'dpc-item dpc-retry',
+        onClick: () => ensureProbe(true),
+      }, h('span', null, copy.retry));
 
       const item = (key, paths, label, onClick, danger) => h('button', {
         key,
@@ -314,6 +382,10 @@ window.__ModuleLoader__.load({
           ref: menuRef,
           style: { left: `${left}px`, bottom: `${bottom}px` },
         },
+          h('div', { className: 'dpc-state' },
+            h('span', { className: dotClass, 'aria-hidden': 'true' }),
+            h('span', null, statusText)),
+          retryRow,
           item('refresh', ICONS.refresh, copy.refresh, () => {
             patch({ menu: false, anchor: null });
             window.location.reload();
@@ -323,8 +395,7 @@ window.__ModuleLoader__.load({
           }, false),
           item('shutdown', ICONS.shutdown, copy.shutdown, () => {
             patch({ menu: false, anchor: null, failure: null, pending: 'shutdown' });
-          }, true),
-          hint === null ? null : h('div', { className: 'dpc-hint' }, hint));
+          }, true));
       }
 
       let dialog = null;

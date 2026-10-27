@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-power-control",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Reload, restart, or shut down the DeepSeek Harness desktop app from inside its window.",

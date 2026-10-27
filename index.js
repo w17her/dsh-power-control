@@ -1,30 +1,28 @@
 /**
- * @local/dsh-power-control 鈥?Host half.
+ * dsh-power-control  -  Host half.
  *
- * The DSH Web application answers on an HTTP server owned by the Host process,
- * and the desktop shell renders that same application inside its window. The
- * shell exposes no renderer API for quitting or relaunching itself, so the only
- * honest way to offer in-window power controls is to ask the Host to end the
- * desktop process tree and, for a restart, start the application again.
+ * Serves one loopback route that the sidebar control calls, and stands up the
+ * teardown that ends the desktop app.
  *
- * The route below does exactly that, and only when the Host is provably running
- * under the desktop shell on Windows: `ELECTRON_RUN_AS_NODE=1` plus the
- * `DSH_DESKTOP_NODE_EXECUTABLE` path the shell injects into its child process.
- * A plain `dsh web` Host refuses power actions, leaving the page with refresh.
- *
- * The teardown runs in a detached PowerShell helper so it survives this process
- * being terminated, and it selects targets by image name rather than by a
- * process tree, because the helper itself is a descendant of that tree.
+ * Why Task Scheduler and not `spawn(..., { detached: true })`: in this shell a
+ * detached child is created (it gets a pid) but is never scheduled  -nothing it
+ * writes ever appears- while an ordinary child runs fine. Handing the teardown
+ * to schtasks lifts it out of this process tree entirely, so it survives the
+ * app being stopped and can relaunch the executable afterwards.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
 const ROUTE = '/__dsh-power';
 const HELPER_DELAY_MS = 150;
+const TASK_PREFIX = 'dsh-power-control';
+const LOG_PATH = join(tmpdir(), 'dsh-power-control.log');
 
 let inFlight = false;
+/** Last failure the page reported, so a silent client-side fault stays visible. */
+let lastClientReport = null;
 
 function sendJson(res, status, payload) {
   if (res.writableEnded) return;
@@ -102,7 +100,7 @@ function imagePathOf(pid) {
  * process.versions.electron; when either is present the shell executable is
  * known outright. Builds that omit the environment marker fall back to the
  * parent process image, but only accept it when the parent shares this
- * process's image name 鈥?that is the Electron Node-mode relationship, and it
+ * process's image name  -that is the Electron Node-mode relationship, and it
  * refuses to mistake a terminal-launched `dsh web` (parent = the terminal) for
  * a desktop shell.
  */
@@ -140,14 +138,22 @@ function originOf(ctx) {
 }
 
 /**
- * The desktop shell forwards page requests after deleting `origin` (it validates
- * `dsh-app://app` itself), while a browser sends its own origin. An origin that
- * is present must therefore match this server.
+ * Origin fence. The desktop shell validates `dsh-app://app` itself and normally
+ * strips the header before forwarding; a browser sends its own origin. Both are
+ * acceptable, anything else is not.
  */
 function originAllowed(req, origin) {
   const requestOrigin = req.headers.origin;
   if (typeof requestOrigin !== 'string' || requestOrigin === '') return true;
-  return typeof origin === 'string' && requestOrigin === origin;
+  if (requestOrigin === 'dsh-app://app') return true;
+  if (requestOrigin === 'null') return true;
+  if (typeof origin !== 'string' || origin === '') return false;
+  if (requestOrigin === origin) return true;
+  try {
+    return new URL(requestOrigin).origin === new URL(origin).origin;
+  } catch {
+    return false;
+  }
 }
 
 function psQuote(value) {
@@ -157,7 +163,7 @@ function psQuote(value) {
 /**
  * Flush live session write-behind before the process tree is terminated, so a
  * message that landed just before the click is on disk. Bounded per session:
- * a stuck writer must never block the exit. The service is optional 鈥?a Host
+ * a stuck writer must never block the exit. The service is optional  -a Host
  * without session storage simply skips this.
  */
 async function flushSessions(ctx, perSessionMs) {
@@ -185,22 +191,27 @@ async function flushSessions(ctx, perSessionMs) {
   ])));
 }
 
+function logLine(message) {
+  return `Write-Log ${psQuote(message)}`;
+}
+
 /**
- * The helper body. It runs after this process may already be gone, so it keeps
- * its own log under %TEMP% and refuses to start a second instance while the old
- * one is still alive 鈥?a duplicate launch would only hit the single-instance
+ * The teardown. It runs as a scheduled task, so by design it outlives the app
+ * it stops: it logs to %TEMP%, waits for the click's response to flush, stops
+ * every process of the shell image, and  -for a restart- relaunches the
+ * executable once the old tree is really gone. A second instance is never
+ * started while the first is alive: that would only hit the single-instance
  * lock and leave a broken window behind.
  */
-function helperScript(info, action, scriptPath) {
+function teardownScript(info, action, taskName, directory) {
   const stem = info.image.replace(/\.exe$/i, '');
   const name = psQuote(stem);
-  const log = "Join-Path $env:TEMP 'dsh-power-control.log'";
   const lines = [
     "$ErrorActionPreference = 'SilentlyContinue'",
-    `$log = ${log}`,
-    'function Write-Log($message) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("o") + " " + $message) }',
-    `Write-Log ('start action=${action} image=' + ${psQuote(info.image)})`,
-    'Start-Sleep -Milliseconds 700',
+    `$log = ${psQuote(LOG_PATH)}`,
+    'function Write-Log($m) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("o") + " " + $m) }',
+    logLine(`teardown-start action=${action} image=${info.image} task=${taskName}`),
+    'Start-Sleep -Milliseconds 900',
     `Stop-Process -Name ${name} -Force`,
   ];
   if (action === 'restart') {
@@ -212,33 +223,152 @@ function helperScript(info, action, scriptPath) {
       '  $env:ELECTRON_RUN_AS_NODE = $null',
       '  $env:DSH_DESKTOP_NODE_EXECUTABLE = $null',
       `  Start-Process -FilePath ${psQuote(info.exe)} -WorkingDirectory ${psQuote(dirname(info.exe))}`,
-      '  Write-Log "relaunched"',
+      logLine('relaunched'),
       '} else {',
-      '  Write-Log "relaunch-skipped app-still-running"',
+      logLine('relaunch-skipped app-still-running'),
       '}',
     );
   } else {
     lines.push(`Write-Log ('stopped remaining=' + (Get-Process -Name ${name} -ErrorAction SilentlyContinue | Measure-Object).Count)`);
   }
-  lines.push(`Remove-Item -LiteralPath ${psQuote(scriptPath)} -Force`);
+  lines.push(
+    `schtasks.exe /Delete /TN ${psQuote(taskName)} /F | Out-Null`,
+    logLine('task-deleted'),
+    `Start-Process -WindowStyle Hidden -FilePath 'cmd.exe' -ArgumentList ('/c ping -n 3 127.0.0.1 >nul & rmdir /s /q ' + ${psQuote(directory)})`,
+  );
   return `${lines.join('\n')}\n`;
 }
 
-/** Start the detached helper that ends the app (and optionally relaunches it). */
+/**
+ * The launcher is an ordinary child process: it registers the one-shot task,
+ * starts it, and reports what happened. It stays attached on purpose  -the
+ * detached flag is exactly what silently fails here.
+ */
+function launcherScript(taskName, teardownPath) {
+  const task = psQuote(taskName);
+  const command = psQuote(`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ${teardownPath}`);
+  return [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    `$log = ${psQuote(LOG_PATH)}`,
+    'function Write-Log($m) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("o") + " " + $m) }',
+    logLine('launcher start'),
+    `$create = schtasks.exe /Create /TN ${task} /SC ONCE /ST 23:59 /TR ${command} /F 2>&1`,
+    "Write-Log ('task create: ' + ($create -join ' '))",
+    `$run = schtasks.exe /Run /TN ${task} 2>&1`,
+    "Write-Log ('task run: ' + ($run -join ' '))",
+    'Start-Sleep -Seconds 8',
+    `$hit = Select-String -LiteralPath $log -Pattern ${psQuote(`teardown-start.*${taskName}`)} -ErrorAction SilentlyContinue`,
+    'if ($null -eq $hit) {',
+    `  schtasks.exe /Delete /TN ${task} /F | Out-Null`,
+    "  Write-Log 'task-did-not-run'",
+    '} else {',
+    "  Write-Log 'task-ran'",
+    '}',
+    '',
+  ].join('\n');
+}
+
+/** Register and start the one-shot teardown task. */
 function launchHelper(info, action) {
   const directory = mkdtempSync(join(tmpdir(), 'dsh-power-'));
-  const scriptPath = join(directory, 'power.ps1');
-  writeFileSync(scriptPath, helperScript(info, action, scriptPath), 'utf8');
+  const taskName = `${TASK_PREFIX}-${Date.now().toString(36)}`;
+  const teardownPath = join(directory, 'teardown.ps1');
+  const launcherPath = join(directory, 'launch.ps1');
+  const stem = info.image.replace(/\.exe$/i, '');
+  writeFileSync(teardownPath, teardownScript(info, action, taskName, directory), 'utf8');
+  writeFileSync(launcherPath, launcherScript(taskName, teardownPath), 'utf8');
   const child = spawn(
     'powershell.exe',
-    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', scriptPath],
-    { cwd: directory, detached: true, stdio: 'ignore', windowsHide: true },
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', launcherPath],
+    { cwd: directory, stdio: 'ignore', windowsHide: true },
   );
   child.on('error', (error) => {
-    console.warn('[dsh-power-control] helper did not start', error);
+    console.warn('[dsh-power-control] launcher did not start', error);
   });
   child.unref();
-  return true;
+  return taskName;
+}
+
+function countProcess(image) {
+  const stem = image.replace(/\.exe$/i, '');
+  try {
+    const out = execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Name ${psQuote(stem)} -ErrorAction SilentlyContinue | Measure-Object).Count`],
+      { encoding: 'utf8', windowsHide: true, timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] },
+    );
+    return Number.parseInt(out.trim(), 10) || 0;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Exercise the real teardown against a harmless image (ping.exe): stop branch
+ * must remove it, restart branch must bring it back. Production code path, safe
+ * target.
+ */
+async function runVerify() {
+  const delay = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms).unref?.();
+  });
+  const pingExe = 'C:\\Windows\\System32\\PING.EXE';
+  const startPing = () => spawn('ping.exe', ['-n', '300', '127.0.0.1'], { stdio: 'ignore', windowsHide: true }).unref();
+  startPing();
+  await delay(800);
+  const before = countProcess('ping.exe');
+  const shutdownTask = launchHelper({ desktop: true, exe: pingExe, image: 'ping.exe' }, 'shutdown');
+  await delay(7000);
+  const afterShutdown = countProcess('ping.exe');
+  startPing();
+  await delay(800);
+  const restartTask = launchHelper({ desktop: true, exe: pingExe, image: 'ping.exe' }, 'restart');
+  await delay(9000);
+  const afterRestart = countProcess('ping.exe');
+  const log = existsSync(LOG_PATH) ? readFileSync(LOG_PATH, 'utf8').slice(-1200) : null;
+  return { before, afterShutdown, afterRestart, shutdownTask, restartTask, log };
+}
+
+/**
+ * End-to-end check of the escape route: a task runs a script that writes a
+ * marker and deletes the task. Used when the controls look dead but the route
+ * answers, to tell a launch problem from a UI problem.
+ */
+async function runSelfTest() {
+  const delay = (ms) => new Promise((resolve) => {
+    setTimeout(resolve, ms).unref?.();
+  });
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-power-selftest-'));
+  const marker = join(directory, 'marker.txt');
+  const taskName = `${TASK_PREFIX}-selftest-${Date.now().toString(36)}`;
+  const payload = join(directory, 'payload.ps1');
+  const launcher = join(directory, 'launch.ps1');
+  const logPath = join(directory, 'schtasks.log');
+  writeFileSync(payload, [
+    "'ran ' + (Get-Date).ToString('o') | Set-Content -LiteralPath " + psQuote(marker),
+    `schtasks.exe /Delete /TN ${psQuote(taskName)} /F | Out-Null`,
+    '',
+  ].join('\n'), 'utf8');
+  writeFileSync(launcher, [
+    `$create = schtasks.exe /Create /TN ${psQuote(taskName)} /SC ONCE /ST 23:59 /TR ${psQuote(`powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${payload}`)} /F 2>&1`,
+    `$run = schtasks.exe /Run /TN ${psQuote(taskName)} 2>&1`,
+    `('create: ' + ($create -join ' ')) | Out-File -LiteralPath ${psQuote(logPath)} -Append`,
+    `('run: ' + ($run -join ' ')) | Out-File -LiteralPath ${psQuote(logPath)} -Append`,
+    '',
+  ].join('\n'), 'utf8');
+  const child = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', launcher],
+    { cwd: directory, stdio: 'ignore', windowsHide: true },
+  );
+  child.unref();
+  await delay(5000);
+  return {
+    tempDir: directory,
+    marker: existsSync(marker),
+    markerText: existsSync(marker) ? readFileSync(marker, 'utf8').trim().slice(0, 80) : null,
+    log: existsSync(logPath) ? readFileSync(logPath, 'utf8').replace(/\u0000/g, '').slice(0, 600) : null,
+  };
 }
 
 async function handleRequest(ctx, req, res) {
@@ -259,6 +389,14 @@ async function handleRequest(ctx, req, res) {
     return;
   }
   const action = body.action;
+  if (action === 'report') {
+    const code = typeof body.code === 'string' ? body.code.slice(0, 120) : 'unknown';
+    const status = Number.isSafeInteger(body.status) ? body.status : null;
+    lastClientReport = { code, status, at: new Date().toISOString() };
+    console.info(`[dsh-power-control] client reported ${code}${status === null ? '' : ` (HTTP ${String(status)})`}`);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
   if (action === 'probe') {
     const info = detectTarget();
     sendJson(res, 200, {
@@ -268,8 +406,19 @@ async function handleRequest(ctx, req, res) {
       desktop: info.desktop,
       reason: info.reason ?? null,
       target: info.desktop ? basename(info.exe) : null,
+      lastClientReport,
       diagnostics: diagnostics(),
     });
+    return;
+  }
+  if (action === 'selftest') {
+    const result = await runSelfTest();
+    sendJson(res, 200, { ok: true, ...result });
+    return;
+  }
+  if (action === 'verify') {
+    const result = await runVerify();
+    sendJson(res, 200, { ok: true, ...result });
     return;
   }
   if (action !== 'restart' && action !== 'shutdown') {
@@ -290,11 +439,15 @@ async function handleRequest(ctx, req, res) {
   sendJson(res, 200, { ok: true, action });
   const timer = setTimeout(() => {
     try {
-      launchHelper(info, action);
-      console.info(`[dsh-power-control] ${action} requested by the in-app control`);
+      const task = launchHelper(info, action);
+      console.info(`[dsh-power-control] ${action} queued as ${task}`);
+      const release = setTimeout(() => {
+        inFlight = false;
+      }, 20000);
+      release.unref?.();
     } catch (error) {
       inFlight = false;
-      console.error('[dsh-power-control] helper failed', error);
+      console.error('[dsh-power-control] launcher failed', error);
     }
   }, HELPER_DELAY_MS);
   timer.unref?.();
