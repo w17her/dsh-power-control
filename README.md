@@ -12,7 +12,7 @@ Windows-desktop only, because that is where the app process tree lives.
 
 ## Download
 
-- **Installable bundle:** [`dsh-power-control-1.2.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.2.0/dsh-power-control-1.2.0.zip) — unzip it and install the folder (see below).
+- **Installable bundle:** [`dsh-power-control-1.3.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.3.0/dsh-power-control-1.3.0.zip) — unzip it and install the folder (see below).
 - **Or clone this repository** — its root *is* the plugin: `package.json`, `index.js`,
   `client.js`, `cordis.patch.yml`, `locale/`, `icon.svg`. There is no build step and no
   compiled output to fetch.
@@ -28,8 +28,8 @@ Windows-desktop only, because that is where the app process tree lives.
 | **Restart app** | Flushes open sessions to disk, then restarts the whole desktop app (same executable, same profile, same workspace). |
 | **Shut down app** | Flushes open sessions to disk, then quits the whole desktop app. |
 
-- One 40 px power button in the sidebar footer, beside Settings.
-- Menu opens upward as a frame-wide popover, so no sidebar scroll container can clip it.
+- One 40 px power button in the sidebar footer, beside Settings; the button itself stays flat.
+- The opened menu is liquid glass: `backdrop-filter` blurs and saturates whatever is behind it, so the page (or wallpaper) shows through. It opens upward as a frame-wide popover, so no sidebar scroll container can clip it.
 - Destructive actions are confirmed first; the confirmation names exactly what will be interrupted.
 - A status veil covers the window while the process is going down, with a fallback
   "reload this window" link if the process is still alive after 9 seconds.
@@ -48,7 +48,7 @@ Windows-desktop only, because that is where the app process tree lives.
 The plugin is a local DSH bundle, not an npm package. Either way works:
 
 **Option 1 — the release zip.** Download
-[`dsh-power-control-1.2.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.2.0/dsh-power-control-1.2.0.zip),
+[`dsh-power-control-1.3.0.zip`](https://github.com/w17her/dsh-power-control/releases/download/v1.3.0/dsh-power-control-1.3.0.zip),
 unzip it, and install the unzipped folder (the one that contains `package.json`) with DSH's
 plugin manager:
 
@@ -154,6 +154,29 @@ locale/zh.json      Plugin display metadata (Chinese)
 icon.svg            Plugin icon
 ```
 
+## Changelog
+
+### 1.3.0
+
+- The opened power menu is liquid glass: 18 px backdrop blur with saturation, a translucent
+  white gradient, a 1 px glass rim and inset highlights, so the page behind it shows
+  through. The trigger itself stays flat and only tints on hover.
+- Restart and shut down run again. In DSH 0.2.x a detached helper got a pid but was never
+  scheduled, so the teardown now runs as a one-shot Windows scheduled task started by an
+  attached launcher.
+- The client retries the probe with backoff, shows a live status line and offers "check
+  again" instead of disabling the actions after one hiccup.
+- `POST /__dsh-power {"action":"selftest"}` and `{"action":"verify"}` prove the teardown
+  without closing the app.
+
+### 1.2.0
+
+- Task Scheduler teardown, wider Origin fence (accepts `dsh-app://app`), probe retry,
+  status line, selftest/verify endpoints.
+
+### 1.0.0
+
+- First release: reload, restart and shut down from the sidebar footer.
 ## License
 
 MIT — see [LICENSE](LICENSE).
